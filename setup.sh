@@ -17,7 +17,10 @@ pkg install -y python ffmpeg git termux-api || true
 
 echo "3) Creating Python venv"
 python -m venv venv
-.
+if [ ! -x venv/bin/python ]; then
+  echo "Failed to create virtualenv. Ensure python is installed and writable." >&2
+  exit 1
+fi
 venv/bin/python -m pip install --upgrade pip
 venv/bin/pip install -r requirements.txt
 
@@ -33,11 +36,12 @@ echo "5) Optional: create Termux:Boot starter script (~/.termux/boot/start_sec_c
 if command -v termux-wake-lock >/dev/null 2>&1; then
   BOOT_DIR="$HOME/.termux/boot"
   mkdir -p "$BOOT_DIR"
-  cat > "$BOOT_DIR/start_sec_cam.sh" <<'EOF'
+  # Create a starter script that cd's to the repo root and launches the daemon.
+  cat > "$BOOT_DIR/start_sec_cam.sh" <<EOF
 #!/usr/bin/env sh
 # Starter for Sec-Cam daemon for Termux:Boot
-cd "$HOME/"sec-cam || exit 1
-source venv/bin/activate
+cd "$ROOT_DIR" || exit 1
+. venv/bin/activate
 termux-wake-lock
 nohup python camera_daemon.py >/dev/null 2>&1 &
 EOF
