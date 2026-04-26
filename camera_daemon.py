@@ -54,6 +54,10 @@ COOLDOWN = float(os.getenv('COOLDOWN', '60'))
 TMP_DIR = Path(os.getenv('TMP_DIR', str(ROOT / 'tmp')))
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# Debug and logging
+DEBUG = os.getenv('DEBUG', '0').lower() in ('1', 'true', 'yes', 'on')
+LOG_FILE = TMP_DIR / 'sec_cam.log'
+
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 running = True
@@ -62,7 +66,13 @@ last_event = 0
 
 
 def log(*args, **kwargs):
-    print(time.strftime('[%Y-%m-%d %H:%M:%S]'), *args, **kwargs)
+    line = time.strftime('[%Y-%m-%d %H:%M:%S]') + ' ' + ' '.join(str(a) for a in args)
+    print(line, **kwargs)
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(line + '\n')
+    except Exception:
+        pass
 
 
 def call_termux_camera(path: Path) -> bool:
@@ -87,42 +97,109 @@ def load_small_gray(path: Path, w=DETECTION_WIDTH, h=DETECTION_HEIGHT):
 
 def assemble_video(img_paths, out_path):
     # Use ffmpeg to assemble images into mp4. Images must be named in order.
-    # Create a temporary directory with symlinked sequential names if needed.
     tmpdir = TMP_DIR / f"ff_{int(time.time())}"
     tmpdir.mkdir(parents=True, exist_ok=True)
     for i, p in enumerate(img_paths):
         dest = tmpdir / f"img_{i:04d}.jpg"
         shutil.copy(str(p), str(dest))
-    cmd = [
-        'ffmpeg', '-y', '-framerate', str(int(1 / RECORD_FRAME_INTERVAL)) , '-i',
-        str(tmpdir / 'img_%04d.jpg'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(out_path)
-    ]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        fr = 1.0 / max(0.001, float(RECORD_FRAME_INTERVAL))
+    except Exception:
+        fr = 1.0
+    framerate = max(1, int(round(fr)))
+
+    # Try libx264 first, then fall back to mpeg4 if not available.
+    cmd1 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(out_path)]
+    try:
+        p = subprocess.run(cmd1, check=True, capture_output=True, text=True)
+        log('ffmpeg produced video (libx264)')
         shutil.rmtree(tmpdir)
         return out_path.exists()
-    except Exception as e:
-        log('ffmpeg failed:', e)
-        shutil.rmtree(tmpdir)
-        return False
+    except subprocess.CalledProcessError as e:
+        log('ffmpeg libx264 failed, stderr:', (e.stderr or '')[:500])
+        # fallback to mpeg4
+        cmd2 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vcodec', 'mpeg4', '-qscale:v', '5', str(out_path)]
+        try:
+            p2 = subprocess.run(cmd2, check=True, capture_output=True, text=True)
+            log('ffmpeg produced video (mpeg4)')
+            shutil.rmtree(tmpdir)
+            return out_path.exists()
+        except subprocess.CalledProcessError as e2:
+            log('ffmpeg fallback failed, stderr:', (e2.stderr or '')[:500])
+            shutil.rmtree(tmpdir)
+            return False
 
 
 def send_photo(path: Path, caption: str = ''):
     url = f"{TG_API}/sendPhoto"
-    with open(path, 'rb') as f:
-        files = {'photo': f}
-        data = {'chat_id': CHAT_ID, 'caption': caption}
-        r = requests.post(url, data=data, files=files, timeout=60)
-    return r.ok
+    try:
+        with open(path, 'rb') as f:
+            files = {'photo': f}
+            data = {'chat_id': CHAT_ID, 'caption': caption}
+            r = requests.post(url, data=data, files=files, timeout=60)
+        if not r.ok:
+            log('send_photo failed', r.status_code, r.text[:500])
+        else:
+            log('send_photo ok', path)
+        return r.ok
+    except Exception as e:
+        log('send_photo exception', e)
+        return False
 
 
 def send_video(path: Path, caption: str = ''):
     url = f"{TG_API}/sendVideo"
-    with open(path, 'rb') as f:
-        files = {'video': f}
-        data = {'chat_id': CHAT_ID, 'caption': caption}
-        r = requests.post(url, data=data, files=files, timeout=120)
-    return r.ok
+    try:
+        with open(path, 'rb') as f:
+            files = {'video': f}
+            data = {'chat_id': CHAT_ID, 'caption': caption}
+            r = requests.post(url, data=data, files=files, timeout=120)
+        if not r.ok:
+            log('send_video failed', r.status_code, r.text[:500])
+        else:
+            log('send_video ok', path)
+        return r.ok
+    except Exception as e:
+        log('send_video exception', e)
+        return False
+
+
+def send_message(text: str) -> bool:
+    try:
+        r = requests.post(f"{TG_API}/sendMessage", data={'chat_id': CHAT_ID, 'text': text}, timeout=10)
+        if not r.ok:
+            log('send_message failed', r.status_code, r.text[:500])
+        return r.ok
+    except Exception as e:
+        log('send_message exception', e)
+        return False
+
+
+def check_telegram() -> bool:
+    """Validate bot token and register commands. Returns True if OK."""
+    try:
+        r = requests.get(f"{TG_API}/getMe", timeout=10)
+        if not r.ok:
+            log('getMe failed', r.status_code, r.text[:500])
+            return False
+        me = r.json().get('result', {})
+        log('Bot info:', me.get('username'), me.get('first_name'))
+        cmds = [
+            {"command": "snap", "description": "Take a snapshot"},
+            {"command": "video", "description": "Record a short video"},
+            {"command": "start", "description": "Resume motion detection"},
+            {"command": "stop", "description": "Pause motion detection"},
+            {"command": "status", "description": "Get current status"}
+        ]
+        r2 = requests.post(f"{TG_API}/setMyCommands", json={"commands": cmds}, timeout=10)
+        if not r2.ok:
+            log('setMyCommands failed', r2.status_code, r2.text[:500])
+        else:
+            log('setMyCommands ok')
+        return True
+    except Exception as e:
+        log('check_telegram exception', e)
+        return False
 
 
 def do_record_and_send():
@@ -147,9 +224,15 @@ def do_record_and_send():
     ok = assemble_video(img_paths, out_mp4)
     if not ok:
         log('Failed to assemble video; sending first photo instead')
-        send_photo(img_paths[0], caption='motion (photo)')
+        ok2 = send_photo(img_paths[0], caption='motion (photo)')
+        if not ok2:
+            log('Failed to send fallback photo')
     else:
-        send_video(out_mp4, caption='motion (video)')
+        ok2 = send_video(out_mp4, caption='motion (video)')
+        if not ok2:
+            log('Failed to send video; attempting to send a photo instead')
+            if img_paths:
+                send_photo(img_paths[0], caption='motion (photo, send failed)')
     # cleanup burst
     try:
         shutil.rmtree(burst_dir)
@@ -161,8 +244,29 @@ def do_record_and_send():
 def telegram_worker():
     """Simple long-polling loop to process commands sent to the bot."""
     log('Telegram worker started')
+    # Ensure bot commands are registered so Telegram clients show them
+    try:
+        cmds = [
+            {"command": "snap", "description": "Take a snapshot"},
+            {"command": "video", "description": "Record a short video"},
+            {"command": "start", "description": "Resume motion detection"},
+            {"command": "stop", "description": "Pause motion detection"},
+            {"command": "status", "description": "Get current status"}
+        ]
+        requests.post(f"{TG_API}/setMyCommands", json={"commands": cmds}, timeout=10)
+    except Exception as e:
+        log('Failed to set bot commands:', e)
     offset = None
     global running, detecting
+    # Prime offset so we don't reprocess old messages: get the latest update id
+    try:
+        r = requests.get(f"{TG_API}/getUpdates", params={'limit': 1}, timeout=5)
+        if r.ok:
+            data = r.json()
+            if data.get('result'):
+                offset = data['result'][-1]['update_id'] + 1
+    except Exception:
+        pass
     while running:
         try:
             params = {'timeout': 30}
@@ -189,13 +293,17 @@ def telegram_worker():
                 if text == '/snap' or text == '/photo':
                     p = TMP_DIR / f"snap_{int(time.time())}.jpg"
                     if call_termux_camera(p):
-                        send_photo(p, caption='snapshot')
+                        ok = send_photo(p, caption='snapshot')
+                        if not ok:
+                            log('failed to send snapshot')
                         try:
                             p.unlink()
                         except Exception:
                             pass
                 elif text == '/video':
-                    do_record_and_send()
+                    ok = do_record_and_send()
+                    if not ok:
+                        requests.post(f"{TG_API}/sendMessage", data={'chat_id': CHAT_ID, 'text': 'failed to produce/send video'})
                 elif text == '/stop':
                     detecting = False
                     requests.post(f"{TG_API}/sendMessage", data={'chat_id': CHAT_ID, 'text': 'detection paused'})
@@ -270,6 +378,13 @@ def main():
     if not BOT_TOKEN or not CHAT_ID:
         print('BOT_TOKEN and CHAT_ID must be set in .env')
         sys.exit(1)
+
+    # validate telegram and register commands
+    ok = check_telegram()
+    if not ok:
+        log('Telegram check failed - bot may not work')
+    else:
+        send_message('Sec-Cam bot started')
 
     # start telegram worker
     tw = threading.Thread(target=telegram_worker, daemon=True)
