@@ -57,6 +57,7 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 # Debug and logging
 DEBUG = os.getenv('DEBUG', '0').lower() in ('1', 'true', 'yes', 'on')
 LOG_FILE = TMP_DIR / 'sec_cam.log'
+FALLBACK_LOG = ROOT / 'sec_cam.log'
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -67,24 +68,50 @@ last_event = 0
 
 def log(*args, **kwargs):
     line = time.strftime('[%Y-%m-%d %H:%M:%S]') + ' ' + ' '.join(str(a) for a in args)
-    print(line, **kwargs)
+    # Always print to stdout for quick debugging and flush so user sees it when running
+    try:
+        print(line, **kwargs)
+        sys.stdout.flush()
+    except Exception:
+        pass
+    # Append to primary log file; on failure, write to fallback log in repo root
     try:
         with open(LOG_FILE, 'a') as f:
             f.write(line + '\n')
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            with open(FALLBACK_LOG, 'a') as f2:
+                f2.write(line + '\n')
+        except Exception:
+            # if file logging fails, at least print an error
+            try:
+                print('LOG WRITE FAILED:', e, file=sys.stderr)
+                sys.stderr.flush()
+            except Exception:
+                pass
 
 
 def call_termux_camera(path: Path) -> bool:
     """Capture a photo using termux-camera-photo
     Returns True if file exists afterwards
     """
-    cmd = ["termux-camera-photo", "-c", str(CAMERA_ID), str(path)]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        log("Camera capture failed:", e)
-        return False
+    # Try with -c <id> first, then fallback to without -c if that fails.
+    cmd1 = ["termux-camera-photo", "-c", str(CAMERA_ID), str(path)]
+    cmd2 = ["termux-camera-photo", str(path)]
+    for cmd in (cmd1, cmd2):
+        try:
+            log('Running camera command:', ' '.join(cmd))
+            p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+            log('camera stdout:', (p.stdout or '')[:200])
+            log('camera stderr:', (p.stderr or '')[:200])
+            if path.exists():
+                return True
+        except subprocess.CalledProcessError as e:
+            log('camera call failed (CalledProcessError):', e.returncode, (e.stderr or '')[:300])
+        except subprocess.TimeoutExpired as e:
+            log('camera call timed out')
+        except Exception as e:
+            log('camera call exception:', e)
     return path.exists()
 
 
@@ -204,6 +231,7 @@ def check_telegram() -> bool:
 
 def do_record_and_send():
     # Capture a burst of images into TMP_DIR
+    log('do_record_and_send: starting')
     timestamp = int(time.time())
     burst_dir = TMP_DIR / f"burst_{timestamp}"
     burst_dir.mkdir(parents=True, exist_ok=True)
@@ -221,6 +249,7 @@ def do_record_and_send():
         log('No frames captured for record')
         return False
     out_mp4 = TMP_DIR / f"event_{timestamp}.mp4"
+    log('Assembling video to', out_mp4)
     ok = assemble_video(img_paths, out_mp4)
     if not ok:
         log('Failed to assemble video; sending first photo instead')
@@ -238,6 +267,7 @@ def do_record_and_send():
         shutil.rmtree(burst_dir)
     except Exception:
         pass
+    log('do_record_and_send: finished')
     return True
 
 
@@ -365,7 +395,12 @@ def detection_loop():
             log('Motion detected - recording')
             last_event = time.time()
             # record and send
-            do_record_and_send()
+            log('Starting record/send...')
+            try:
+                ok = do_record_and_send()
+                log('do_record_and_send returned', ok)
+            except Exception as e:
+                log('do_record_and_send exception', e)
 
         tmp_snap.unlink(missing_ok=True)
         # sleep until next interval
