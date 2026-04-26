@@ -64,6 +64,12 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 running = True
 detecting = True
 last_event = 0
+# Authorization: use CHAT_ID from env if set, otherwise will auto-authorize first messenger
+AUTHORIZED_CHAT = str(CHAT_ID).strip() if CHAT_ID else None
+
+VIDEO_WIDTH = int(os.getenv('VIDEO_WIDTH', '640'))
+MAX_TELEGRAM_VIDEO_BYTES = int(os.getenv('MAX_TELEGRAM_VIDEO_BYTES', str(48 * 1024 * 1024)))
+FFMPEG_TIMEOUT = int(os.getenv('FFMPEG_TIMEOUT', '30'))
 
 
 def log(*args, **kwargs):
@@ -134,27 +140,71 @@ def assemble_video(img_paths, out_path):
     except Exception:
         fr = 1.0
     framerate = max(1, int(round(fr)))
-
     # Try libx264 first, then fall back to mpeg4 if not available.
-    cmd1 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(out_path)]
-    try:
-        p = subprocess.run(cmd1, check=True, capture_output=True, text=True)
-        log('ffmpeg produced video (libx264)')
-        shutil.rmtree(tmpdir)
-        return out_path.exists()
-    except subprocess.CalledProcessError as e:
-        log('ffmpeg libx264 failed, stderr:', (e.stderr or '')[:500])
-        # fallback to mpeg4
-        cmd2 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vcodec', 'mpeg4', '-qscale:v', '5', str(out_path)]
+    def run_ffmpeg_stream(cmd):
+        log('Running ffmpeg:', ' '.join(cmd))
         try:
-            p2 = subprocess.run(cmd2, check=True, capture_output=True, text=True)
-            log('ffmpeg produced video (mpeg4)')
-            shutil.rmtree(tmpdir)
-            return out_path.exists()
-        except subprocess.CalledProcessError as e2:
-            log('ffmpeg fallback failed, stderr:', (e2.stderr or '')[:500])
-            shutil.rmtree(tmpdir)
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            try:
+                stderr, _ = p.communicate(timeout=FFMPEG_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                log('ffmpeg timed out, killing')
+                p.kill()
+                try:
+                    stderr, _ = p.communicate(timeout=5)
+                except Exception:
+                    stderr = ''
+                return False
+            # log last portion of stderr if present
+            if stderr:
+                for line in stderr.splitlines()[-20:]:
+                    log('ffmpeg stderr:', line)
+            return p.returncode == 0
+        except FileNotFoundError:
+            log('ffmpeg not found')
             return False
+        except Exception as e:
+            log('ffmpeg run exception', e)
+            return False
+
+    cmd1 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(out_path)]
+    ok = run_ffmpeg_stream(cmd1)
+    if ok and out_path.exists():
+        size = out_path.stat().st_size
+        log('ffmpeg produced video (libx264), size=', size)
+        if size > MAX_TELEGRAM_VIDEO_BYTES:
+            log('video too large for Telegram, size bytes=', size)
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+            return False
+        shutil.rmtree(tmpdir)
+        return True
+
+    # fallback to mpeg4
+    log('ffmpeg libx264 failed or produced no output, trying mpeg4 fallback')
+    cmd2 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vcodec', 'mpeg4', '-qscale:v', '5', str(out_path)]
+    ok2 = run_ffmpeg_stream(cmd2)
+    if ok2 and out_path.exists():
+        size = out_path.stat().st_size
+        log('ffmpeg produced video (mpeg4), size=', size)
+        if size > MAX_TELEGRAM_VIDEO_BYTES:
+            log('video too large for Telegram, size bytes=', size)
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+            return False
+        shutil.rmtree(tmpdir)
+        return True
+
+    log('ffmpeg fallback failed')
+    try:
+        shutil.rmtree(tmpdir)
+    except Exception:
+        pass
+    return False
 
 
 def send_photo(path: Path, caption: str = ''):
@@ -253,9 +303,29 @@ def do_record_and_send():
     ok = assemble_video(img_paths, out_mp4)
     if not ok:
         log('Failed to assemble video; sending first photo instead')
-        ok2 = send_photo(img_paths[0], caption='motion (photo)')
-        if not ok2:
-            log('Failed to send fallback photo')
+        # Try to send a small set of photos as fallback (first, middle, last)
+        try:
+            n = len(img_paths)
+            candidates = []
+            if n >= 1:
+                candidates.append(img_paths[0])
+            if n >= 3:
+                candidates.append(img_paths[n // 2])
+            if n >= 2:
+                candidates.append(img_paths[-1])
+            sent_any = False
+            for idx, p in enumerate(candidates):
+                log('Fallback send photo', idx, p)
+                try:
+                    ok2 = send_photo(p, caption=f'motion (photo {idx+1}/{len(candidates)})')
+                    if ok2:
+                        sent_any = True
+                except Exception as e:
+                    log('fallback send_photo exception', e)
+            if not sent_any:
+                log('Failed to send any fallback photos')
+        except Exception as e:
+            log('fallback photo send exception', e)
     else:
         ok2 = send_video(out_mp4, caption='motion (video)')
         if not ok2:
@@ -396,6 +466,22 @@ def detection_loop():
             last_event = time.time()
             # record and send
             log('Starting record/send...')
+            # If DEBUG is enabled, attempt an immediate snapshot send to validate Telegram upload path
+            if DEBUG:
+                try:
+                    dbg_p = TMP_DIR / f"dbg_snap_{int(time.time())}.jpg"
+                    log('DEBUG: taking immediate snapshot to', dbg_p)
+                    if call_termux_camera(dbg_p):
+                        ok_dbg = send_photo(dbg_p, caption='debug snapshot on motion')
+                        log('DEBUG: send_photo returned', ok_dbg)
+                        try:
+                            dbg_p.unlink()
+                        except Exception:
+                            pass
+                    else:
+                        log('DEBUG: immediate snapshot failed')
+                except Exception as e:
+                    log('DEBUG: exception while doing immediate snapshot/send', e)
             try:
                 ok = do_record_and_send()
                 log('do_record_and_send returned', ok)
