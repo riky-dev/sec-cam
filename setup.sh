@@ -12,11 +12,11 @@ echo "1) Updating packages"
 pkg update -y || true
 pkg upgrade -y || true
 
-echo "2) Installing required packages: python, ffmpeg, git, termux-api"
-pkg install -y python ffmpeg git termux-api || true
+echo "2) Installing required packages: python, ffmpeg, git, termux-api, python-numpy"
+pkg install -y python ffmpeg git termux-api python-numpy || true
 
-echo "3) Creating Python venv"
-python -m venv venv
+echo "3) Creating Python venv (using system site packages so pkg-installed numpy is available)"
+python -m venv --system-site-packages venv
 if [ ! -x venv/bin/python ]; then
   echo "Failed to create virtualenv. Ensure python is installed and writable." >&2
   exit 1
