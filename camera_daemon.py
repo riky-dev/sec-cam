@@ -23,7 +23,7 @@ import shutil
 from pathlib import Path
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
     import numpy as np
     import requests
     from dotenv import load_dotenv
@@ -140,6 +140,13 @@ def assemble_video(img_paths, out_path):
     except Exception:
         fr = 1.0
     framerate = max(1, int(round(fr)))
+
+    # Quick sanity-check: can we open the first image with PIL?
+    try:
+        im0 = Image.open(img_paths[0])
+        log('first image read ok, size=', im0.size, 'mode=', im0.mode)
+    except Exception as e:
+        log('first image cannot be opened by PIL:', e)
     # Try libx264 first, then fall back to mpeg4 if not available.
     def run_ffmpeg_stream(cmd):
         log('Running ffmpeg:', ' '.join(cmd))
@@ -172,15 +179,19 @@ def assemble_video(img_paths, out_path):
     if ok and out_path.exists():
         size = out_path.stat().st_size
         log('ffmpeg produced video (libx264), size=', size)
-        if size > MAX_TELEGRAM_VIDEO_BYTES:
-            log('video too large for Telegram, size bytes=', size)
-            try:
-                shutil.rmtree(tmpdir)
-            except Exception:
-                pass
-            return False
-        shutil.rmtree(tmpdir)
-        return True
+        if size <= 1024:
+            log('produced file extremely small; treating as failure')
+            ok = False
+        else:
+            if size > MAX_TELEGRAM_VIDEO_BYTES:
+                log('video too large for Telegram, size bytes=', size)
+                try:
+                    shutil.rmtree(tmpdir)
+                except Exception:
+                    pass
+                return None
+            shutil.rmtree(tmpdir)
+            return out_path
 
     # fallback to mpeg4
     log('ffmpeg libx264 failed or produced no output, trying mpeg4 fallback')
@@ -189,17 +200,36 @@ def assemble_video(img_paths, out_path):
     if ok2 and out_path.exists():
         size = out_path.stat().st_size
         log('ffmpeg produced video (mpeg4), size=', size)
-        if size > MAX_TELEGRAM_VIDEO_BYTES:
-            log('video too large for Telegram, size bytes=', size)
+        if size <= 1024:
+            log('produced file extremely small; treating as failure')
+            ok2 = False
+        else:
+            if size > MAX_TELEGRAM_VIDEO_BYTES:
+                log('video too large for Telegram, size bytes=', size)
+                try:
+                    shutil.rmtree(tmpdir)
+                except Exception:
+                    pass
+                return None
+            shutil.rmtree(tmpdir)
+            return out_path
+
+    log('ffmpeg fallback failed; attempting to produce GIF as fallback')
+    # Attempt to create a GIF instead
+    gif_path = out_path.with_suffix('.gif')
+    try:
+        okgif = make_gif(img_paths, gif_path)
+        if okgif and gif_path.exists():
+            log('GIF fallback produced', gif_path)
+            # return the gif path (caller will decide how to send)
             try:
                 shutil.rmtree(tmpdir)
             except Exception:
                 pass
-            return False
-        shutil.rmtree(tmpdir)
-        return True
+            return gif_path
+    except Exception as e:
+        log('GIF fallback exception', e)
 
-    log('ffmpeg fallback failed')
     try:
         shutil.rmtree(tmpdir)
     except Exception:
@@ -252,6 +282,54 @@ def send_message(text: str) -> bool:
         return False
 
 
+def send_animation(path: Path, caption: str = '') -> bool:
+    url = f"{TG_API}/sendAnimation"
+    try:
+        with open(path, 'rb') as f:
+            files = {'animation': f}
+            data = {'chat_id': CHAT_ID, 'caption': caption}
+            r = requests.post(url, data=data, files=files, timeout=120)
+        if not r.ok:
+            log('send_animation failed', r.status_code, r.text[:500])
+        else:
+            log('send_animation ok', path)
+        return r.ok
+    except Exception as e:
+        log('send_animation exception', e)
+        return False
+
+
+def make_gif(img_paths, out_gif_path: Path, max_width=VIDEO_WIDTH, duration_ms=None):
+    """Create a GIF from the list of image paths using Pillow.
+    duration_ms: per-frame duration in milliseconds
+    Returns True on success.
+    """
+    try:
+        frames = []
+        for p in img_paths:
+            try:
+                im = Image.open(p).convert('RGB')
+            except Exception as e:
+                log('make_gif: failed to open', p, e)
+                continue
+            # resize if wider than max_width
+            if im.width > max_width:
+                nh = int(im.height * (max_width / im.width))
+                im = im.resize((max_width, nh), Image.BILINEAR)
+            frames.append(im)
+        if not frames:
+            log('make_gif: no frames to make gif')
+            return False
+        if duration_ms is None:
+            duration_ms = int(RECORD_FRAME_INTERVAL * 1000)
+        frames[0].save(out_gif_path, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0, optimize=True)
+        log('make_gif: saved', out_gif_path)
+        return True
+    except Exception as e:
+        log('make_gif exception', e)
+        return False
+
+
 def check_telegram() -> bool:
     """Validate bot token and register commands. Returns True if OK."""
     try:
@@ -300,10 +378,9 @@ def do_record_and_send():
         return False
     out_mp4 = TMP_DIR / f"event_{timestamp}.mp4"
     log('Assembling video to', out_mp4)
-    ok = assemble_video(img_paths, out_mp4)
-    if not ok:
-        log('Failed to assemble video; sending first photo instead')
-        # Try to send a small set of photos as fallback (first, middle, last)
+    result = assemble_video(img_paths, out_mp4)
+    if not result:
+        log('Failed to assemble video; sending a set of fallback photos')
         try:
             n = len(img_paths)
             candidates = []
@@ -327,11 +404,29 @@ def do_record_and_send():
         except Exception as e:
             log('fallback photo send exception', e)
     else:
-        ok2 = send_video(out_mp4, caption='motion (video)')
-        if not ok2:
-            log('Failed to send video; attempting to send a photo instead')
-            if img_paths:
-                send_photo(img_paths[0], caption='motion (photo, send failed)')
+        # assemble_video returned a Path to the resulting media (mp4 or gif)
+        if isinstance(result, Path):
+            media_path = result
+            suffix = media_path.suffix.lower()
+            if suffix in ('.mp4', '.mov'):
+                ok2 = send_video(media_path, caption='motion (video)')
+                if not ok2:
+                    log('Failed to send video; attempting to send photos as fallback')
+                    if img_paths:
+                        for p in img_paths[:3]:
+                            send_photo(p, caption='motion (photo, send failed)')
+            elif suffix in ('.gif',):
+                ok2 = send_animation(media_path, caption='motion (animation)')
+                if not ok2:
+                    log('Failed to send animation; attempting to send photos as fallback')
+                    if img_paths:
+                        for p in img_paths[:3]:
+                            send_photo(p, caption='motion (photo, send failed)')
+            else:
+                # unknown suffix - try send_video then send_photo
+                ok2 = send_video(media_path, caption='motion (video)')
+                if not ok2 and img_paths:
+                    send_photo(img_paths[0], caption='motion (photo, send failed)')
     # cleanup burst
     try:
         shutil.rmtree(burst_dir)
