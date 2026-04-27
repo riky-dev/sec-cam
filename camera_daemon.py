@@ -62,7 +62,9 @@ FALLBACK_LOG = ROOT / 'sec_cam.log'
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 running = True
-detecting = True
+# Use an Event for pause/resume semantics so /stop takes effect immediately.
+detection_event = threading.Event()
+detection_event.set()  # detection enabled by default
 last_event = 0
 # Authorization: use CHAT_ID from env if set, otherwise will auto-authorize first messenger
 AUTHORIZED_CHAT = str(CHAT_ID).strip() if CHAT_ID else None
@@ -97,6 +99,28 @@ def log(*args, **kwargs):
                 pass
 
 
+def dbg(*args, **kwargs):
+    """Debug logging - only prints when DEBUG is true."""
+    if not DEBUG:
+        return
+    log(*args, **kwargs)
+
+
+def parse_command(text: str) -> str:
+    """Extract the base command from Telegram message text.
+    e.g. '/stop@MyBot extra' -> 'stop'
+    Returns lowercase command without leading '/'. Empty string if not a command.
+    """
+    if not text:
+        return ''
+    token = text.split()[0]
+    if not token.startswith('/'):
+        return ''
+    token = token.lstrip('/')
+    token = token.split('@')[0]
+    return token.lower().strip()
+
+
 def call_termux_camera(path: Path) -> bool:
     """Capture a photo using termux-camera-photo
     Returns True if file exists afterwards
@@ -106,18 +130,19 @@ def call_termux_camera(path: Path) -> bool:
     cmd2 = ["termux-camera-photo", str(path)]
     for cmd in (cmd1, cmd2):
         try:
-            log('Running camera command:', ' '.join(cmd))
+            dbg('Running camera command:', ' '.join(cmd))
             p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
-            log('camera stdout:', (p.stdout or '')[:200])
-            log('camera stderr:', (p.stderr or '')[:200])
+            dbg('camera stdout:', (p.stdout or '')[:200])
+            dbg('camera stderr:', (p.stderr or '')[:200])
             if path.exists():
+                dbg('camera captured file', path)
                 return True
         except subprocess.CalledProcessError as e:
-            log('camera call failed (CalledProcessError):', e.returncode, (e.stderr or '')[:300])
-        except subprocess.TimeoutExpired as e:
-            log('camera call timed out')
+            dbg('camera call failed (CalledProcessError):', e.returncode, (e.stderr or '')[:300])
+        except subprocess.TimeoutExpired:
+            dbg('camera call timed out')
         except Exception as e:
-            log('camera call exception:', e)
+            dbg('camera call exception:', e)
     return path.exists()
 
 
@@ -149,7 +174,7 @@ def assemble_video(img_paths, out_path):
         log('first image cannot be opened by PIL:', e)
     # Try libx264 first, then fall back to mpeg4 if not available.
     def run_ffmpeg_stream(cmd):
-        log('Running ffmpeg:', ' '.join(cmd))
+        dbg('Running ffmpeg:', ' '.join(cmd))
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             try:
@@ -165,7 +190,7 @@ def assemble_video(img_paths, out_path):
             # log last portion of stderr if present
             if stderr:
                 for line in stderr.splitlines()[-20:]:
-                    log('ffmpeg stderr:', line)
+                    dbg('ffmpeg stderr:', line)
             return p.returncode == 0
         except FileNotFoundError:
             log('ffmpeg not found')
@@ -350,7 +375,7 @@ def check_telegram() -> bool:
         if not r2.ok:
             log('setMyCommands failed', r2.status_code, r2.text[:500])
         else:
-            log('setMyCommands ok')
+            dbg('setMyCommands ok')
         return True
     except Exception as e:
         log('check_telegram exception', e)
@@ -452,7 +477,7 @@ def telegram_worker():
     except Exception as e:
         log('Failed to set bot commands:', e)
     offset = None
-    global running, detecting
+    global running
     # Prime offset so we don't reprocess old messages: get the latest update id
     try:
         r = requests.get(f"{TG_API}/getUpdates", params={'limit': 1}, timeout=5)
@@ -481,33 +506,41 @@ def telegram_worker():
                 chat = msg.get('chat', {})
                 from_id = chat.get('id')
                 # Only accept commands from the configured chat
-                if str(from_id) != str(CHAT_ID):
-                    log('Ignoring message from unknown chat', from_id)
+                if AUTHORIZED_CHAT and str(from_id) != AUTHORIZED_CHAT:
+                    dbg('Ignoring message from unknown chat', from_id)
                     continue
-                log('Received command:', text)
-                if text == '/snap' or text == '/photo':
-                    p = TMP_DIR / f"snap_{int(time.time())}.jpg"
-                    if call_termux_camera(p):
-                        ok = send_photo(p, caption='snapshot')
-                        if not ok:
-                            log('failed to send snapshot')
-                        try:
-                            p.unlink()
-                        except Exception:
-                            pass
-                elif text == '/video':
-                    ok = do_record_and_send()
-                    if not ok:
-                        requests.post(f"{TG_API}/sendMessage", data={'chat_id': CHAT_ID, 'text': 'failed to produce/send video'})
-                elif text == '/stop':
-                    detecting = False
-                    requests.post(f"{TG_API}/sendMessage", data={'chat_id': CHAT_ID, 'text': 'detection paused'})
-                elif text == '/start':
-                    detecting = True
-                    requests.post(f"{TG_API}/sendMessage", data={'chat_id': CHAT_ID, 'text': 'detection resumed'})
-                elif text == '/status':
-                    status = 'running' if detecting else 'paused'
-                    requests.post(f"{TG_API}/sendMessage", data={'chat_id': CHAT_ID, 'text': f'status: {status}'})
+                dbg('Received raw command text:', text)
+                cmd = parse_command(text)
+                if not cmd:
+                    continue
+                log('Received command:', cmd)
+                if cmd in ('snap', 'photo'):
+                    # take snapshot and send
+                    def snap_job():
+                        p = TMP_DIR / f"snap_{int(time.time())}.jpg"
+                        if call_termux_camera(p):
+                            ok = send_photo(p, caption='snapshot')
+                            if not ok:
+                                log('failed to send snapshot')
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
+                    threading.Thread(target=snap_job, daemon=True).start()
+                    send_message('snapshot requested')
+                elif cmd == 'video':
+                    # start record in background
+                    threading.Thread(target=do_record_and_send, daemon=True).start()
+                    send_message('video requested')
+                elif cmd == 'stop':
+                    detection_event.clear()
+                    send_message('detection paused')
+                elif cmd == 'start':
+                    detection_event.set()
+                    send_message('detection resumed')
+                elif cmd == 'status':
+                    status = 'running' if detection_event.is_set() else 'paused'
+                    send_message(f'status: {status}')
         except Exception as e:
             log('Telegram worker error', e)
             time.sleep(1)
@@ -519,8 +552,9 @@ def detection_loop():
     motion_count = 0
     global last_event
     while running:
-        if not detecting:
-            time.sleep(1)
+        if not detection_event.is_set():
+            # paused
+            time.sleep(0.5)
             continue
         t0 = time.time()
         tmp_snap = TMP_DIR / f"detect_{int(t0)}.jpg"
@@ -550,7 +584,7 @@ def detection_loop():
         # threshold
         changed = diff > PIXEL_THRESHOLD
         ratio = float(np.sum(changed)) / changed.size
-        log(f'motion ratio={ratio:.4f}')
+        dbg(f'motion ratio={ratio:.4f}')
         if ratio > MOTION_RATIO_THRESHOLD:
             motion_count += 1
         else:
@@ -559,29 +593,32 @@ def detection_loop():
         if motion_count >= MIN_MOTION_FRAMES and (time.time() - last_event) > COOLDOWN:
             log('Motion detected - recording')
             last_event = time.time()
-            # record and send
-            log('Starting record/send...')
-            # If DEBUG is enabled, attempt an immediate snapshot send to validate Telegram upload path
-            if DEBUG:
+            # run recording in a separate thread so detection loop continues
+            def record_thread():
+                log('record_thread started')
+                if DEBUG:
+                    try:
+                        dbg_p = TMP_DIR / f"dbg_snap_{int(time.time())}.jpg"
+                        dbg('DEBUG: taking immediate snapshot to', dbg_p)
+                        if call_termux_camera(dbg_p):
+                            ok_dbg = send_photo(dbg_p, caption='debug snapshot on motion')
+                            dbg('DEBUG: send_photo returned', ok_dbg)
+                            try:
+                                dbg_p.unlink()
+                            except Exception:
+                                pass
+                        else:
+                            dbg('DEBUG: immediate snapshot failed')
+                    except Exception as e:
+                        dbg('DEBUG: exception while doing immediate snapshot/send', e)
                 try:
-                    dbg_p = TMP_DIR / f"dbg_snap_{int(time.time())}.jpg"
-                    log('DEBUG: taking immediate snapshot to', dbg_p)
-                    if call_termux_camera(dbg_p):
-                        ok_dbg = send_photo(dbg_p, caption='debug snapshot on motion')
-                        log('DEBUG: send_photo returned', ok_dbg)
-                        try:
-                            dbg_p.unlink()
-                        except Exception:
-                            pass
-                    else:
-                        log('DEBUG: immediate snapshot failed')
+                    res = do_record_and_send()
+                    log('record_thread finished, result=', bool(res))
                 except Exception as e:
-                    log('DEBUG: exception while doing immediate snapshot/send', e)
-            try:
-                ok = do_record_and_send()
-                log('do_record_and_send returned', ok)
-            except Exception as e:
-                log('do_record_and_send exception', e)
+                    log('record_thread exception', e)
+
+            t = threading.Thread(target=record_thread, daemon=True)
+            t.start()
 
         tmp_snap.unlink(missing_ok=True)
         # sleep until next interval
