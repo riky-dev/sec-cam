@@ -483,6 +483,7 @@ def do_record_and_send():
     timestamp = int(time.time())
     event_id = f"evt_{timestamp}"
     # Notify user that motion was detected and we are preparing the video
+    msg = None
     try:
         msg = send_message(f"Motion detected — preparing video (id={event_id})")
         # msg may contain message_id for replying later
@@ -502,142 +503,188 @@ def do_record_and_send():
         time.sleep(RECORD_FRAME_INTERVAL)
     if not img_paths:
         log('No frames captured for record')
+        try:
+            shutil.rmtree(burst_dir)
+        except Exception:
+            pass
         return False
     out_mp4 = TMP_DIR / f"event_{timestamp}.mp4"
     log('Assembling video to', out_mp4)
     result = assemble_video(img_paths, out_mp4)
-    if not result:
-        log('Failed to assemble video; sending a set of fallback photos')
-        # Notify user that assembly failed and fallback photos will be sent
-        try:
-            send_message(f'Failed to assemble video (id={event_id}) — sending fallback photos')
-        except Exception:
-            # don't let notification failures interrupt fallback processing
-            pass
-        try:
-            n = len(img_paths)
-            candidates = []
-            if n >= 1:
-                candidates.append(img_paths[0])
-            if n >= 3:
-                candidates.append(img_paths[n // 2])
-            if n >= 2:
-                candidates.append(img_paths[-1])
-            sent_any = False
-            for idx, p in enumerate(candidates):
-                log('Fallback send photo', idx, p)
-                try:
-                    cap = f'motion (photo {idx+1}/{len(candidates)}) id={event_id}'
-                    ok2 = send_photo(p, caption=cap)
-                    # ok2 is the Telegram API response dict when successful
-                    if ok2:
-                        sent_any = True
-                        # if we have the pre-record message, reply to it with the photo
-                        try:
-                            if isinstance(msg, dict) and msg.get('result') and msg['result'].get('message_id'):
-                                reply_to = msg['result']['message_id']
-                                # edit message by replying? Telegram supports reply_to_message_id in sendPhoto
-                                # Re-send the photo as a reply by calling sendPhoto with reply_to_message_id
-                                files = {'photo': open(str(p), 'rb')}
-                                data = {'chat_id': CHAT_ID, 'caption': cap, 'reply_to_message_id': reply_to}
-                                requests.post(f"{TG_API}/sendPhoto", data=data, files=files, timeout=60)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    log('fallback send_photo exception', e)
-            if not sent_any:
-                log('Failed to send any fallback photos')
-        except Exception as e:
-            log('fallback photo send exception', e)
-            else:
-                # assemble_video returned a Path to the resulting media (mp4 or gif)
+    # decide how to send assembled media (or fall back)
+    try:
+        if not result:
+            log('Failed to assemble video; sending a set of fallback photos')
+            try:
+                send_message(f'Failed to assemble video (id={event_id}) — sending fallback photos')
+            except Exception:
+                pass
+            try:
+                n = len(img_paths)
+                candidates = []
+                if n >= 1:
+                    candidates.append(img_paths[0])
+                if n >= 3:
+                    candidates.append(img_paths[n // 2])
+                if n >= 2:
+                    candidates.append(img_paths[-1])
+                sent_any = False
+                for idx, p in enumerate(candidates):
+                    log('Fallback send photo', idx, p)
+                    try:
+                        cap = f'motion (photo {idx+1}/{len(candidates)}) id={event_id}'
+                        ok2 = send_photo(p, caption=cap)
+                        if ok2:
+                            sent_any = True
+                            try:
+                                if isinstance(msg, dict) and msg.get('result') and msg['result'].get('message_id'):
+                                    reply_to = msg['result']['message_id']
+                                    files = {'photo': open(str(p), 'rb')}
+                                    data = {'chat_id': CHAT_ID, 'caption': cap, 'reply_to_message_id': reply_to}
+                                    requests.post(f"{TG_API}/sendPhoto", data=data, files=files, timeout=60)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        log('fallback send_photo exception', e)
+                if not sent_any:
+                    log('Failed to send any fallback photos')
+            except Exception as e:
+                log('fallback photo send exception', e)
+        else:
+            # assemble_video returned a Path to the resulting media (mp4 or gif) or a path-like
+            try:
                 if isinstance(result, Path):
                     media_path = result
-                    suffix = media_path.suffix.lower()
-                    # Prepare caption including event id
-                    cap_base = f'motion (id={event_id})'
-                    if suffix in ('.mp4', '.mov'):
-                        # Inform user that the video was assembled and will be sent
-                        try:
-                            send_message(f'Video assembled (id={event_id}) — sending video')
-                        except Exception:
-                            pass
-                        # try to send the video and reply to the pre-record message if possible
-                        try:
-                            # if we have the pre-record message id, send as reply
-                            reply_to = None
-                        if isinstance(msg, dict) and msg.get('result') and msg['result'].get('message_id'):
-                            reply_to = msg['result']['message_id']
-                        if reply_to:
-                            with open(media_path, 'rb') as f:
-                                files = {'video': f}
-                                data = {'chat_id': CHAT_ID, 'caption': cap_base, 'reply_to_message_id': reply_to}
-                                r = requests.post(f"{TG_API}/sendVideo", data=data, files=files, timeout=120)
-                                if not r.ok:
-                                    log('send_video failed (reply)', r.status_code, r.text[:500])
-                                    ok2 = None
-                                else:
-                                    ok2 = r.json()
-                        else:
-                            ok2 = send_video(media_path, caption=cap_base)
-                    except Exception as e:
-                        log('exception sending video', e)
-                        ok2 = None
-                        if not ok2:
-                            log('Failed to send video; attempting to send photos as fallback')
-                            try:
-                                send_message(f'Failed to send video (id={event_id}) — sending fallback photos')
-                            except Exception:
-                                pass
-                            if img_paths:
-                                for p in img_paths[:3]:
-                                    send_photo(p, caption=cap_base + ' (photo, send failed)')
-                    elif suffix in ('.gif',):
-                        try:
-                            # Inform user that a GIF animation will be sent
-                            try:
-                                send_message(f'Animation assembled (id={event_id}) — sending animation')
-                            except Exception:
-                                pass
-                            reply_to = None
-                            if isinstance(msg, dict) and msg.get('result') and msg['result'].get('message_id'):
-                                reply_to = msg['result']['message_id']
-                            if reply_to:
-                                with open(media_path, 'rb') as f:
-                                    files = {'animation': f}
-                                    data = {'chat_id': CHAT_ID, 'caption': cap_base, 'reply_to_message_id': reply_to}
-                                    r = requests.post(f"{TG_API}/sendAnimation", data=data, files=files, timeout=120)
-                                    if not r.ok:
-                                        log('send_animation failed (reply)', r.status_code, r.text[:500])
-                                        ok2 = None
-                                    else:
-                                        ok2 = r.json()
-                            else:
-                                ok2 = send_animation(media_path, caption=cap_base)
-                        except Exception as e:
-                            log('exception sending animation', e)
-                            ok2 = None
-                        if not ok2:
-                            log('Failed to send animation; attempting to send photos as fallback')
-                            try:
-                                send_message(f'Failed to send animation (id={event_id}) — sending fallback photos')
-                            except Exception:
-                                pass
-                            if img_paths:
-                                for p in img_paths[:3]:
-                                    send_photo(p, caption=cap_base + ' (photo, send failed)')
+                    _send_media_path(media_path, img_paths, event_id, msg)
                 else:
-                    # unknown suffix - try send_video then send_photo
-                    ok2 = send_video(media_path, caption=cap_base)
+                    # unknown result type - try to send via send_video then fall back to photo
+                    try:
+                        ok2 = send_video(result, caption=f'motion (id={event_id})')
+                    except Exception:
+                        ok2 = None
                     if not ok2 and img_paths:
-                        send_photo(img_paths[0], caption=cap_base + ' (photo, send failed)')
-    # cleanup burst
-    try:
-        shutil.rmtree(burst_dir)
-    except Exception:
-        pass
-    log('do_record_and_send: finished')
+                        send_photo(img_paths[0], caption=f'motion (id={event_id}) (photo, send failed)')
+            except Exception as e:
+                log('exception while sending assembled media', e)
+    finally:
+        # cleanup burst
+        try:
+            shutil.rmtree(burst_dir)
+        except Exception:
+            pass
+        log('do_record_and_send: finished')
     return True
+
+
+def _send_media_path(media_path: Path, img_paths, event_id: str, pre_msg=None):
+    """Send assembled media (video/gif). Fall back to photos on failure.
+    Returns True if sending succeeded (or fallback attempted), False otherwise.
+    """
+    cap_base = f'motion (id={event_id})'
+    suffix = media_path.suffix.lower()
+
+    # extract reply_to message id from pre_msg safely
+    reply_to = None
+    try:
+        if isinstance(pre_msg, dict) and pre_msg.get('result') and pre_msg['result'].get('message_id'):
+            reply_to = pre_msg['result']['message_id']
+    except Exception:
+        reply_to = None
+
+    if suffix in ('.mp4', '.mov'):
+        try:
+            try:
+                send_message(f'Video assembled (id={event_id}) — sending video')
+            except Exception:
+                pass
+            if reply_to:
+                with open(media_path, 'rb') as f:
+                    files = {'video': f}
+                    data = {'chat_id': CHAT_ID, 'caption': cap_base, 'reply_to_message_id': reply_to}
+                    r = requests.post(f"{TG_API}/sendVideo", data=data, files=files, timeout=120)
+                    if not r.ok:
+                        log('send_video failed (reply)', r.status_code, r.text[:500])
+                        ok = None
+                    else:
+                        try:
+                            ok = r.json()
+                        except Exception:
+                            ok = {'ok': True}
+            else:
+                ok = send_video(media_path, caption=cap_base)
+        except Exception as e:
+            log('exception sending video', e)
+            ok = None
+
+        if not ok:
+            log('Failed to send video; attempting to send photos as fallback')
+            try:
+                send_message(f'Failed to send video (id={event_id}) — sending fallback photos')
+            except Exception:
+                pass
+            for p in img_paths[:3]:
+                try:
+                    send_photo(p, caption=cap_base + ' (photo, send failed)')
+                except Exception:
+                    pass
+            return False
+        return True
+
+    elif suffix == '.gif':
+        try:
+            try:
+                send_message(f'Animation assembled (id={event_id}) — sending animation')
+            except Exception:
+                pass
+            if reply_to:
+                with open(media_path, 'rb') as f:
+                    files = {'animation': f}
+                    data = {'chat_id': CHAT_ID, 'caption': cap_base, 'reply_to_message_id': reply_to}
+                    r = requests.post(f"{TG_API}/sendAnimation", data=data, files=files, timeout=120)
+                    if not r.ok:
+                        log('send_animation failed (reply)', r.status_code, r.text[:500])
+                        ok = None
+                    else:
+                        try:
+                            ok = r.json()
+                        except Exception:
+                            ok = {'ok': True}
+            else:
+                ok = send_animation(media_path, caption=cap_base)
+        except Exception as e:
+            log('exception sending animation', e)
+            ok = None
+
+        if not ok:
+            log('Failed to send animation; attempting to send photos as fallback')
+            try:
+                send_message(f'Failed to send animation (id={event_id}) — sending fallback photos')
+            except Exception:
+                pass
+            for p in img_paths[:3]:
+                try:
+                    send_photo(p, caption=cap_base + ' (photo, send failed)')
+                except Exception:
+                    pass
+            return False
+        return True
+
+    else:
+        # unknown suffix - try send_video then send_photo
+        try:
+            ok = send_video(media_path, caption=cap_base)
+        except Exception:
+            ok = None
+        if not ok and img_paths:
+            try:
+                send_photo(img_paths[0], caption=cap_base + ' (photo, send failed)')
+            except Exception:
+                pass
+            return False
+        return True
+
+
+    # (end of _send_media_path)
 
 
 def telegram_worker():
