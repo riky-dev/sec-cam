@@ -72,9 +72,9 @@ AUTHORIZED_CHAT = str(CHAT_ID).strip() if CHAT_ID else None
 VIDEO_WIDTH = int(os.getenv('VIDEO_WIDTH', '640'))
 MAX_TELEGRAM_VIDEO_BYTES = int(os.getenv('MAX_TELEGRAM_VIDEO_BYTES', str(48 * 1024 * 1024)))
 FFMPEG_TIMEOUT = int(os.getenv('FFMPEG_TIMEOUT', '30'))
-SEND_AS_DOCUMENT = os.getenv('SEND_AS_DOCUMENT', '0').lower() in ('1', 'true', 'yes')
-
-
+FFMPEG_PRESET = os.getenv('FFMPEG_PRESET', 'ultrafast')
+FFMPEG_CRF = int(os.getenv('FFMPEG_CRF', '36'))
+VALIDATE_VIDEO = os.getenv('VALIDATE_VIDEO', '0').lower() in ('1', 'true', 'yes')
 def log(*args, **kwargs):
     line = time.strftime('[%Y-%m-%d %H:%M:%S]') + ' ' + ' '.join(str(a) for a in args)
     # Always print to stdout for quick debugging and flush so user sees it when running
@@ -160,7 +160,26 @@ def assemble_video(img_paths, out_path):
     tmpdir.mkdir(parents=True, exist_ok=True)
     for i, p in enumerate(img_paths):
         dest = tmpdir / f"img_{i:04d}.jpg"
-        shutil.copy(str(p), str(dest))
+        # Downscale images before encoding to speed up ffmpeg and reduce CPU/IO
+        try:
+            im = Image.open(p)
+            # fix orientation from EXIF if present
+            try:
+                im = ImageOps.exif_transpose(im)
+            except Exception:
+                pass
+            # scale if wider than VIDEO_WIDTH
+            if im.width > VIDEO_WIDTH:
+                nh = int(im.height * (VIDEO_WIDTH / im.width))
+                im = im.resize((VIDEO_WIDTH, nh), Image.BILINEAR)
+            im.save(dest, format='JPEG', quality=60, optimize=True)
+            dbg('wrote resized frame', dest)
+        except Exception as e:
+            dbg('failed to prepare frame', p, e)
+            try:
+                shutil.copy(str(p), str(dest))
+            except Exception:
+                pass
     try:
         fr = 1.0 / max(0.001, float(RECORD_FRAME_INTERVAL))
     except Exception:
@@ -228,9 +247,8 @@ def assemble_video(img_paths, out_path):
             return False
 
     # Use libx264 with baseline profile and faststart to improve streaming/playback on Telegram
-    # scale frames to VIDEO_WIDTH to improve compatibility with mobile players
-    vf_scale = f"scale={VIDEO_WIDTH}:-2"
-    cmd1 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vf', vf_scale, '-c:v', 'libx264', '-profile:v', 'baseline', '-level', '3.0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(out_path)]
+    # frames were pre-resized to VIDEO_WIDTH; avoid ffmpeg scaling to save CPU/time
+    cmd1 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-c:v', 'libx264', '-preset', FFMPEG_PRESET, '-crf', str(FFMPEG_CRF), '-profile:v', 'baseline', '-level', '3.0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-threads', '0', str(out_path)]
     ok = run_ffmpeg_stream(cmd1)
     if ok and out_path.exists():
         size = out_path.stat().st_size
@@ -256,7 +274,7 @@ def assemble_video(img_paths, out_path):
             else:
                 log('Produced video failed validation; attempting to re-encode from images')
                 re_out = out_path.with_suffix('.re.mp4')
-                cmd_re = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vf', vf_scale, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(re_out)]
+                cmd_re = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-c:v', 'libx264', '-preset', FFMPEG_PRESET, '-crf', str(FFMPEG_CRF), '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-threads', '0', str(re_out)]
                 ok_re = run_ffmpeg_stream(cmd_re)
                 if ok_re and re_out.exists() and validate_video_file(re_out, timeout=FFMPEG_TIMEOUT):
                     try:
@@ -269,7 +287,7 @@ def assemble_video(img_paths, out_path):
 
     # fallback to mpeg4
     log('ffmpeg libx264 failed or produced no output, trying mpeg4 fallback')
-    cmd2 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vf', vf_scale, '-vcodec', 'mpeg4', '-qscale:v', '5', '-movflags', '+faststart', str(out_path)]
+    cmd2 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vcodec', 'mpeg4', '-qscale:v', '5', '-movflags', '+faststart', '-threads', '0', str(out_path)]
     ok2 = run_ffmpeg_stream(cmd2)
     if ok2 and out_path.exists():
         size = out_path.stat().st_size
@@ -352,21 +370,8 @@ def send_video(path: Path, caption: str = ''):
         return False
 
 
-def send_document(path: Path, caption: str = '') -> bool:
-    url = f"{TG_API}/sendDocument"
-    try:
-        with open(path, 'rb') as f:
-            files = {'document': f}
-            data = {'chat_id': CHAT_ID, 'caption': caption}
-            r = requests.post(url, data=data, files=files, timeout=120)
-        if not r.ok:
-            log('send_document failed', r.status_code, r.text[:500])
-        else:
-            log('send_document ok', path)
-        return r.ok
-    except Exception as e:
-        log('send_document exception', e)
-        return False
+# send_document removed — videos are sent via send_video (sendDocument workaround removed)
+
 
 
 def send_message(text: str) -> bool:
@@ -507,10 +512,7 @@ def do_record_and_send():
             media_path = result
             suffix = media_path.suffix.lower()
             if suffix in ('.mp4', '.mov'):
-                if SEND_AS_DOCUMENT:
-                    ok2 = send_document(media_path, caption='motion (video)')
-                else:
-                    ok2 = send_video(media_path, caption='motion (video)')
+                ok2 = send_video(media_path, caption='motion (video)')
                 if not ok2:
                     log('Failed to send video; attempting to send photos as fallback')
                     if img_paths:
