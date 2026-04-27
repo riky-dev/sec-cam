@@ -72,6 +72,7 @@ AUTHORIZED_CHAT = str(CHAT_ID).strip() if CHAT_ID else None
 VIDEO_WIDTH = int(os.getenv('VIDEO_WIDTH', '640'))
 MAX_TELEGRAM_VIDEO_BYTES = int(os.getenv('MAX_TELEGRAM_VIDEO_BYTES', str(48 * 1024 * 1024)))
 FFMPEG_TIMEOUT = int(os.getenv('FFMPEG_TIMEOUT', '30'))
+SEND_AS_DOCUMENT = os.getenv('SEND_AS_DOCUMENT', '0').lower() in ('1', 'true', 'yes')
 
 
 def log(*args, **kwargs):
@@ -199,7 +200,37 @@ def assemble_video(img_paths, out_path):
             log('ffmpeg run exception', e)
             return False
 
-    cmd1 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(out_path)]
+
+    def validate_video_file(p: Path, timeout=15) -> bool:
+        """Use ffmpeg to validate that the produced video file is readable.
+        Returns True if ffmpeg can read the file and exit code 0.
+        """
+        if not p.exists():
+            return False
+        cmd = ['ffmpeg', '-v', 'error', '-i', str(p), '-f', 'null', '-']
+        dbg('validate_video_file running:', ' '.join(cmd))
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=timeout)
+            if proc.returncode == 0:
+                dbg('validate_video_file ok')
+                return True
+            else:
+                log('validate_video_file failed, stderr:', (proc.stderr or '')[:500])
+                return False
+        except subprocess.TimeoutExpired:
+            log('validate_video_file timed out')
+            return False
+        except FileNotFoundError:
+            log('ffmpeg not found for validation')
+            return False
+        except Exception as e:
+            log('validate_video_file exception', e)
+            return False
+
+    # Use libx264 with baseline profile and faststart to improve streaming/playback on Telegram
+    # scale frames to VIDEO_WIDTH to improve compatibility with mobile players
+    vf_scale = f"scale={VIDEO_WIDTH}:-2"
+    cmd1 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vf', vf_scale, '-c:v', 'libx264', '-profile:v', 'baseline', '-level', '3.0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(out_path)]
     ok = run_ffmpeg_stream(cmd1)
     if ok and out_path.exists():
         size = out_path.stat().st_size
@@ -215,12 +246,30 @@ def assemble_video(img_paths, out_path):
                 except Exception:
                     pass
                 return None
-            shutil.rmtree(tmpdir)
-            return out_path
+            # Validate produced file with ffmpeg - if it's invalid, try re-encode from images
+            if validate_video_file(out_path, timeout=FFMPEG_TIMEOUT):
+                try:
+                    shutil.rmtree(tmpdir)
+                except Exception:
+                    pass
+                return out_path
+            else:
+                log('Produced video failed validation; attempting to re-encode from images')
+                re_out = out_path.with_suffix('.re.mp4')
+                cmd_re = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vf', vf_scale, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(re_out)]
+                ok_re = run_ffmpeg_stream(cmd_re)
+                if ok_re and re_out.exists() and validate_video_file(re_out, timeout=FFMPEG_TIMEOUT):
+                    try:
+                        shutil.move(str(re_out), str(out_path))
+                        shutil.rmtree(tmpdir)
+                        log('Re-encoded video succeeded')
+                        return out_path
+                    except Exception as e:
+                        log('Re-encode move failed', e)
 
     # fallback to mpeg4
     log('ffmpeg libx264 failed or produced no output, trying mpeg4 fallback')
-    cmd2 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vcodec', 'mpeg4', '-qscale:v', '5', str(out_path)]
+    cmd2 = ['ffmpeg', '-y', '-framerate', str(framerate), '-i', str(tmpdir / 'img_%04d.jpg'), '-vf', vf_scale, '-vcodec', 'mpeg4', '-qscale:v', '5', '-movflags', '+faststart', str(out_path)]
     ok2 = run_ffmpeg_stream(cmd2)
     if ok2 and out_path.exists():
         size = out_path.stat().st_size
@@ -236,8 +285,15 @@ def assemble_video(img_paths, out_path):
                 except Exception:
                     pass
                 return None
-            shutil.rmtree(tmpdir)
-            return out_path
+            # Validate mpeg4 file
+            if validate_video_file(out_path, timeout=FFMPEG_TIMEOUT):
+                try:
+                    shutil.rmtree(tmpdir)
+                except Exception:
+                    pass
+                return out_path
+            else:
+                log('mpeg4 produced but failed validation')
 
     log('ffmpeg fallback failed; attempting to produce GIF as fallback')
     # Attempt to create a GIF instead
@@ -293,6 +349,23 @@ def send_video(path: Path, caption: str = ''):
         return r.ok
     except Exception as e:
         log('send_video exception', e)
+        return False
+
+
+def send_document(path: Path, caption: str = '') -> bool:
+    url = f"{TG_API}/sendDocument"
+    try:
+        with open(path, 'rb') as f:
+            files = {'document': f}
+            data = {'chat_id': CHAT_ID, 'caption': caption}
+            r = requests.post(url, data=data, files=files, timeout=120)
+        if not r.ok:
+            log('send_document failed', r.status_code, r.text[:500])
+        else:
+            log('send_document ok', path)
+        return r.ok
+    except Exception as e:
+        log('send_document exception', e)
         return False
 
 
@@ -434,7 +507,10 @@ def do_record_and_send():
             media_path = result
             suffix = media_path.suffix.lower()
             if suffix in ('.mp4', '.mov'):
-                ok2 = send_video(media_path, caption='motion (video)')
+                if SEND_AS_DOCUMENT:
+                    ok2 = send_document(media_path, caption='motion (video)')
+                else:
+                    ok2 = send_video(media_path, caption='motion (video)')
                 if not ok2:
                     log('Failed to send video; attempting to send photos as fallback')
                     if img_paths:
