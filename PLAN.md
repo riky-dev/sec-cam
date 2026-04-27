@@ -55,3 +55,12 @@ Notes
 
 - The setup script will optionally create a Termux:Boot starter script so the daemon can start automatically on boot.
 - Video recording is done by capturing a burst of images then assembling them with ffmpeg. This is more portable than trying to access a /dev/video device and works reliably without special camera device nodes.
+
+Performance and validation notes
+
+- The daemon can validate assembled mp4 files using ffmpeg to ensure they are readable before sending. This is enabled by the VALIDATE_VIDEO setting (default: 0 for speed). Validation can catch corrupt outputs but adds extra CPU/time.
+- Tuning knobs: RECORD_DURATION, RECORD_FRAME_INTERVAL, VIDEO_WIDTH, FFMPEG_PRESET, FFMPEG_CRF, VALIDATE_VIDEO. Lower durations, lower resolution and faster presets reduce CPU and upload time.
+
+User notifications
+
+- On motion detection the daemon sends an immediate Telegram message announcing the event and an event id (e.g. evt_1616161616). The assembled video or fallback photos include that id in their caption and are sent as replies to the initial message when possible. This groups related messages in Telegram and gives you a quick in-chat reference id for each event.
